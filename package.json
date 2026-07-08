@@ -8,7 +8,10 @@
     "test": "node --experimental-specifier-resolution=node dist/test.js"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
+    "@types/node": "^26.1.0",
     "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "simple-git": "^3.36.0"
   }
 }

@@ -1,21 +1,63 @@
-# 库
+# sync-lib
 
-本项目应当是一个TypeScript库。目前还在设计中
+基于 Git 的结构化数据同步库。
 
-这一库是针对一个方案的关键实现的聚合：该方案提出一种使用git仓库，不仅分发软件本身，同时用仓库来同步数据的情况。
+## 核心设计
 
-例如：某单人使用软件，在某仓库中维护，其使用xml存储数据，并在git中包含所有更新。现在，要提供给多人同时使用：这套逻辑仍然有效，然而，一旦fetch不及时。会导致显示内容过时、修改存在冲突等情况。
+- **每个操作一个 commit**：每次 create/update/delete 直接生成一个 Git commit
+- **数据存储**：`data.json` 文件存储所有数据
+- **冲突解决**：
+  - 不同路径：自动深度合并（JSON deep merge）
+  - 相同路径：LWW（Last Write Wins），基于 commit timestamp
+- **自动同步**：push 失败自动 pull + merge + retry
 
-再例如有另外一个仓库，使用json存储数据，面临的情况是相似的。
+## 架构
 
-本目录提供的库，力图：完全代理git操作，向上层提供通用的接口，像操作远程api那样自然的sync。
+```
+src/
+  git.ts           Git 封装（基于 simple-git）
+  data-manager.ts  数据管理（set/delete/get）
+  sync-manager.ts  同步管理（push/pull/polling）
+  types.ts         类型定义
+  index.ts         导出
+  test.ts          测试用例
+```
 
-本库也同时提供一个Demo，此demo能使用子git仓库来演示测试该库提供的100%无冲突效果。
+## 测试
 
-我目前的痛点是：受限于公司流程，你唯一的中心化存储介质就是那个现成的、大家都能连通的 Vanilla Git 仓库。然而，需要：考虑用git做到类似数据库的效果。目标是一个原先我自己使用的软件，在一个git仓库里同时包括：src、json数据。每次使用后，提交新的json。现在我们几个人要同时使用这个软件，遇到了问题：我添加了一个简单的软件代理git功能，现在软件会自己做：fetch、update、commit、pull、push等功能。然而：
+```bash
+pnpm build
+pnpm test
+```
 
-1. 一旦别人和我都在更改相同东西，别人提交后，我这边的pull就需要我介入合并冲突。
-2. 一旦别人提交后，我也提交，还是回到了pull冲突的问题
-3. 如果改的完全不一样，并上下文良好，那倒是没有问题
+测试覆盖场景：
+1. 基本操作（create/update/delete）
+2. 单用户连续操作
+3. 双用户并发（不同路径）- 深度合并
+4. 双用户并发（相同路径）- LWW
+5. 离线操作恢复
+6. 多节点竞争
+7. 轮询自动同步
 
-你来充分调研开源方案。英文搜索优先。中文也可以搜一下
+## 使用示例
+
+```typescript
+import { SyncManager } from './sync-manager.js';
+
+// 初始化
+const sync = new SyncManager('/path/to/repo', 'user1');
+await sync.init();
+
+// 设置数据（自动 commit）
+const dm = sync.getDataManager();
+await dm.set(['users', 'user1'], { name: 'Alice', age: 30 });
+
+// 推送到远程（自动处理并发）
+await sync.push();
+
+// 同步远程更新（自动处理冲突）
+await sync.sync();
+
+// 启动轮询自动同步
+sync.startPolling();
+```

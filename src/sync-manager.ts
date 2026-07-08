@@ -1,14 +1,10 @@
 import { Git } from './git.js';
-import { OperationLog } from './operation-log.js';
 import { DataManager } from './data-manager.js';
-import { Operation } from './types.js';
 
 // 同步管理器
 export class SyncManager {
   private git: Git;
-  private opLog: OperationLog;
   private dataManager: DataManager;
-  private actorId: string;
   private pollInterval: number;
   private polling: boolean = false;
   private pollTimer?: NodeJS.Timeout;
@@ -16,16 +12,14 @@ export class SyncManager {
   constructor(
     repoPath: string,
     actorId: string,
-    pollInterval: number = 5000 // 默认5秒轮询
+    pollInterval: number = 5000
   ) {
     this.git = new Git(repoPath);
-    this.actorId = actorId;
-    this.pollInterval = pollInterval;
-    this.opLog = new OperationLog(this.git);
     this.dataManager = new DataManager(this.git, actorId);
+    this.pollInterval = pollInterval;
   }
 
-  // 初始化
+  // 初始化：加载数据
   async init(): Promise<void> {
     await this.dataManager.init();
   }
@@ -33,6 +27,11 @@ export class SyncManager {
   // 获取数据管理器
   getDataManager(): DataManager {
     return this.dataManager;
+  }
+
+  // 获取 Git 实例
+  getGit(): Git {
+    return this.git;
   }
 
   // 启动轮询同步
@@ -67,59 +66,24 @@ export class SyncManager {
     }
   }
 
-  // 手动同步
-  async sync(): Promise<{ pulled: number; pushed: boolean }> {
-    // 1. Fetch检查更新
-    const hasUpdates = await this.git.fetch();
+  // 手动同步：pull + reload data
+  async sync(): Promise<{ pulled: boolean; conflicts: string[] }> {
+    // 1. Pull 远程更新（自动处理冲突）
+    const result = await this.git.pull();
 
-    if (!hasUpdates) {
-      // 即使没有远程更新，也尝试pull（可能本地有未同步的状态）
-      await this.git.pull();
-      // 重新加载数据
-      await this.dataManager.syncOperations();
-      return { pulled: 0, pushed: false };
-    }
+    // 2. 重新加载数据
+    await this.dataManager.sync();
 
-    // 2. Pull拉取文件
-    const pulled = await this.git.pull();
-    if (!pulled) {
-      // Pull失败，但仍然尝试重新加载数据
-      console.warn('Git pull returned false, but continuing...');
-    }
-
-    // 3. 重新加载所有操作并重建数据
-    await this.dataManager.syncOperations();
-
-    return { pulled: 1, pushed: false };
+    return { pulled: result.success, conflicts: result.conflicts };
   }
 
-  // 推送本地更改（失败时自动pull重试）
+  // 推送本地更改（自动处理并发）
   async push(maxRetries = 3): Promise<boolean> {
-    for (let i = 0; i < maxRetries; i++) {
-      // 检查是否有未推送的更改
-      const hasChanges = await this.git.hasChanges();
-      if (!hasChanges) {
-        return false;
-      }
-
-      const success = await this.git.push();
-      if (success) {
-        return true;
-      }
-
-      // push失败，尝试pull然后重试
-      console.log(`Push失败，尝试pull后重试 (${i + 1}/${maxRetries})...`);
-      await this.sync();
-
-      // 等待一下再重试
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    return false;
+    return await this.git.push('main', maxRetries);
   }
 
-  // 获取Git实例（用于测试）
-  getGit(): Git {
-    return this.git;
+  // 获取提交历史
+  async getHistory(count = 100) {
+    return await this.git.getHistory(count);
   }
 }
