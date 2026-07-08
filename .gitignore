@@ -1,0 +1,20 @@
+# 构建产物
+dist/
+
+# 依赖
+node_modules/
+
+# 测试数据（运行时生成）
+test-repos/
+
+# 编辑器 / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# 环境
+.env
+.envrc

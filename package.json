@@ -1,0 +1,14 @@
+{
+  "name": "sync-lib",
+  "version": "0.1.0",
+  "description": "基于git的结构化数据同步库",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-specifier-resolution=node dist/test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  }
+}
