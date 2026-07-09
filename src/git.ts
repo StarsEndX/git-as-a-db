@@ -9,13 +9,82 @@ export interface CommitMetadata {
   path: string[];
 }
 
+// push 结果
+export interface PushResult {
+  success: boolean;
+  pulled: boolean;  // 重试过程中是否执行了 pull
+  message: string;
+}
+
+// push 重试耗尽错误
+export class PushRetryExhaustedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PushRetryExhaustedError';
+  }
+}
+
+// 检查是否是普通对象（排除 Date、RegExp、Map、Set 等）
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+// 递归排序对象 key（保证 JSON 序列化稳定）
+// 非 plain object（Date、RegExp 等）原样返回
+export function sortObjectKeys(obj: unknown): unknown {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(sortObjectKeys);
+  if (!isPlainObject(obj)) return obj;  // 非 plain object 不处理
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortObjectKeys(obj[key]);
+  }
+  return sorted;
+}
+
+// 深度比较两个值（支持 NaN）
+export function deepEqual(a: unknown, b: unknown): boolean {
+  // NaN 处理
+  if (typeof a === 'number' && typeof b === 'number') {
+    if (isNaN(a) && isNaN(b)) return true;
+    return a === b;
+  }
+  if (a === b) return true;
+  if (a === null || b === null) return a === b;
+  if (a === undefined || b === undefined) return a === b;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== 'object') return false;
+
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+
+  if (Array.isArray(a)) {
+    const arrA = a as unknown[];
+    const arrB = b as unknown[];
+    if (arrA.length !== arrB.length) return false;
+    return arrA.every((val, i) => deepEqual(val, arrB[i]));
+  }
+
+  const objA = a as Record<string, unknown>;
+  const objB = b as Record<string, unknown>;
+  const keysA = Object.keys(objA);
+  const keysB = Object.keys(objB);
+  if (keysA.length !== keysB.length) return false;
+  // 使用 Object.hasOwn 避免原型链污染
+  return keysA.every(key => Object.hasOwn(objB, key) && deepEqual(objA[key], objB[key]));
+}
+
 // Git 操作封装（基于 simple-git）
 export class Git {
   private git: SimpleGit;
   private cwd: string;
+  private branch: string;
 
-  constructor(cwd: string) {
+  constructor(cwd: string, branch: string = 'main') {
     this.cwd = cwd;
+    this.branch = branch;
     const options: Partial<SimpleGitOptions> = {
       baseDir: cwd,
       binary: 'git',
@@ -64,15 +133,30 @@ export class Git {
   }
 
   // 提交更改（带元数据）
+  // 调用方负责 stage 文件，commit() 只检查 staged changes 并 commit
   async commit(message: string, metadata?: CommitMetadata): Promise<string> {
-    // 检查是否有更改
-    const status = await this.git.status();
-    if (status.isClean()) {
-      throw new Error('No changes to commit');
+    // 暂存 data.json（如果存在）
+    const dataFilePath = path.join(this.cwd, 'data.json');
+    try {
+      await fs.access(dataFilePath);
+      await this.git.add(['data.json']);
+    } catch (error: any) {
+      // 只处理文件不存在的情况，其他错误（权限等）忽略
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+      // data.json 不存在，不 stage 任何文件
     }
 
-    // 暂存所有更改
-    await this.git.add('-A');
+    // 检查是否有 staged changes（不用 isClean，因为 untracked files 会导致误判）
+    const status = await this.git.status();
+    if (status.staged.length === 0 && !status.isClean()) {
+      // 有 unstaged/untracked 变更但没有 staged 变更
+      throw new Error('No changes to commit');
+    }
+    if (status.staged.length === 0 && status.isClean()) {
+      throw new Error('No changes to commit');
+    }
 
     // 构建 commit message（包含元数据）
     let commitMessage = message;
@@ -86,16 +170,30 @@ export class Git {
   }
 
   // 推送到远程（自动处理并发冲突）
-  async push(branch: string = 'main', maxRetries = 3): Promise<boolean> {
+  async push(branch?: string, maxRetries = 3): Promise<PushResult> {
+    const targetBranch = branch || this.branch;
+    let pulled = false;
+
     for (let i = 0; i < maxRetries; i++) {
       try {
-        await this.git.push('origin', branch);
-        return true;
+        await this.git.push('origin', targetBranch);
+        return { success: true, pulled, message: 'Push succeeded' };
       } catch (error: any) {
-        // push 失败，可能是因为远程有新提交
-        if (error.message.includes('rejected') || error.message.includes('non-fast-forward')) {
+        // 只处理 push 被拒绝的情况（远程有新提交）
+        const isRejected = /rejected|non-fast-forward|fetch first|pull first/i.test(error.message);
+        if (isRejected) {
           // 先 pull 再重试
-          await this.pull(branch);
+          const pullResult = await this.pull(targetBranch);
+          pulled = true;
+
+          if (!pullResult.success) {
+            return {
+              success: false,
+              pulled: true,
+              message: `Pull failed during push retry: ${pullResult.conflicts.join(', ')}`,
+            };
+          }
+
           // 等待一下再重试（避免过于激进）
           await new Promise(resolve => setTimeout(resolve, 100 * (i + 1)));
         } else {
@@ -104,13 +202,18 @@ export class Git {
         }
       }
     }
-    return false;
+
+    // 重试耗尽，返回 PushRetryExhaustedError
+    throw new PushRetryExhaustedError(
+      `Push failed after ${maxRetries} retries. Local state may have changed (pull was performed).`
+    );
   }
 
   // 拉取远程更新（自动处理冲突，LWW 策略）
-  async pull(branch: string = 'main'): Promise<{ success: boolean; conflicts: string[] }> {
+  async pull(branch?: string): Promise<{ success: boolean; conflicts: string[] }> {
+    const targetBranch = branch || this.branch;
     try {
-      await this.git.pull('origin', branch, ['--rebase=false']);
+      await this.git.pull('origin', targetBranch, ['--rebase=false']);
       return { success: true, conflicts: [] };
     } catch (error: any) {
       // 检查是否有冲突
@@ -120,10 +223,23 @@ export class Git {
         const conflicts = status.conflicted;
 
         // 自动解决冲突（LWW）
-        await this.resolveConflictsLWW(conflicts);
+        try {
+          await this.resolveConflictsLWW(conflicts);
+        } catch (resolveError: any) {
+          // 解决失败，尝试 abort merge
+          try {
+            await this.git.merge(['--abort']);
+          } catch {
+            // abort 也失败，仓库可能处于不一致状态
+            console.error('Failed to abort merge:', resolveError.message);
+          }
+          return { success: false, conflicts };
+        }
 
-        // 完成 merge
-        await this.git.add('-A');
+        // 完成 merge：stage 所有已解决的冲突文件
+        for (const file of conflicts) {
+          await this.git.add(file);
+        }
         await this.git.commit('Auto-merge: resolved conflicts (LWW)');
 
         return { success: true, conflicts };
@@ -135,7 +251,7 @@ export class Git {
     }
   }
 
-  // LWW 冲突解决：对于 data.json 使用深度合并，其他文件用 LWW
+  // LWW 冲突解决：对于 data.json 使用 3-way 深度合并，其他文件用 LWW
   private async resolveConflictsLWW(files: string[]): Promise<void> {
     // 获取 HEAD 和 MERGE_HEAD 的 timestamp
     const headTimestamp = await this.getCommitTimestamp('HEAD');
@@ -149,88 +265,199 @@ export class Git {
       throw new Error('No MERGE_HEAD found during conflict resolution');
     }
 
+    // 时间戳相同时用 hash 打破平局（确定性，所有文件统一策略）
+    const timestampsEqual = headTimestamp === mergeHeadTimestamp;
+    let hashTiebreak = false;
+    if (timestampsEqual) {
+      hashTiebreak = await this.shouldPreferTheirsByHash();
+    }
+    const preferTheirs = mergeHeadTimestamp > headTimestamp ||
+      (timestampsEqual && hashTiebreak);
+
     for (const file of files) {
       if (file === 'data.json') {
-        // 对于 data.json，使用深度合并
+        // 对于 data.json，使用 3-way 深度合并
         await this.mergeDataJson(headTimestamp, mergeHeadTimestamp);
       } else {
         // 其他文件用简单的 LWW
-        const useTheirs = mergeHeadTimestamp >= headTimestamp;
-        if (useTheirs) {
-          await this.git.checkout(['--theirs', file]);
+        if (preferTheirs) {
+          await this.git.checkout(['--theirs', '--', file]);
         } else {
-          await this.git.checkout(['--ours', file]);
+          await this.git.checkout(['--ours', '--', file]);
         }
       }
     }
   }
 
-  // 深度合并 data.json
+  // 时间戳相同时用 hash 打破平局（确定性）
+  private async shouldPreferTheirsByHash(): Promise<boolean> {
+    try {
+      const headHash = await this.git.raw(['rev-parse', 'HEAD']);
+      const mergeHeadHash = await this.git.raw(['rev-parse', 'MERGE_HEAD']);
+      // 用 hash 字符串比较，保证确定性
+      return mergeHeadHash.trim() > headHash.trim();
+    } catch {
+      return false;
+    }
+  }
+
+  // 3-way 合并 data.json
   private async mergeDataJson(headTimestamp: number, mergeHeadTimestamp: number): Promise<void> {
-    // 获取 HEAD 和 MERGE_HEAD 版本的 data.json
+    // 获取 base（共同祖先）版本的 data.json
+    let base: Record<string, unknown> = {};
+    try {
+      const mergeBase = await this.git.raw(['merge-base', 'HEAD', 'MERGE_HEAD']);
+      const baseContent = await this.git.show([`${mergeBase.trim()}:data.json`]);
+      base = JSON.parse(baseContent);
+    } catch {
+      // 没有共同祖先或解析失败，使用空对象
+      base = {};
+    }
+
     const oursContent = await this.git.show(['HEAD:data.json']);
     const theirsContent = await this.git.show(['MERGE_HEAD:data.json']);
 
-    let ours: any = {};
-    let theirs: any = {};
+    let ours: Record<string, unknown> = {};
+    let theirs: Record<string, unknown> = {};
 
     try {
       ours = JSON.parse(oursContent);
-    } catch {
+    } catch (e) {
+      console.warn('Failed to parse ours data.json, using empty object');
       ours = {};
     }
 
     try {
       theirs = JSON.parse(theirsContent);
-    } catch {
+    } catch (e) {
+      console.warn('Failed to parse theirs data.json, using empty object');
       theirs = {};
     }
 
-    // 深度合并
-    const useTheirs = mergeHeadTimestamp >= headTimestamp;
-    const merged = this.deepMerge(ours, theirs, useTheirs);
+    // 3-way 深度合并
+    const merged = this.threeWayMerge(base, ours, theirs, headTimestamp, mergeHeadTimestamp);
 
-    // 写入合并后的文件
+    // 写入合并后的文件（key 排序保证稳定）
     const fullPath = path.join(this.cwd, 'data.json');
-    await fs.writeFile(fullPath, JSON.stringify(merged, null, 2), 'utf-8');
+    await fs.writeFile(fullPath, JSON.stringify(sortObjectKeys(merged), null, 2), 'utf-8');
   }
 
-  // 深度合并两个对象
-  private deepMerge(ours: any, theirs: any, preferTheirs: boolean): any {
-    // 如果都是对象，递归合并
-    if (this.isPlainObject(ours) && this.isPlainObject(theirs)) {
-      const result: any = {};
-      const allKeys = new Set([...Object.keys(ours), ...Object.keys(theirs)]);
+  // 3-way 深度合并
+  // 规则：
+  // - 一方删除、另一方未修改 → 删除生效
+  // - 一方删除、另一方修改 → 修改方赢（LWW）
+  // - 双方都修改 → LWW（timestamp 大的赢，相同时 hash 打破平局）
+  // - 双方都删除 → 删除
+  // - 只有一方修改 → 修改生效
+  private threeWayMerge(
+    base: Record<string, unknown>,
+    ours: Record<string, unknown>,
+    theirs: Record<string, unknown>,
+    oursTimestamp: number,
+    theirsTimestamp: number,
+  ): Record<string, unknown> {
+    // 统一 tiebreak 策略
+    const timestampsEqual = oursTimestamp === theirsTimestamp;
+    const preferTheirs = theirsTimestamp > oursTimestamp || timestampsEqual;
 
-      for (const key of allKeys) {
-        if (key in ours && key in theirs) {
-          // 两边都有，递归合并
-          result[key] = this.deepMerge(ours[key], theirs[key], preferTheirs);
-        } else if (key in ours) {
-          // 只在 ours 中
+    const result: Record<string, unknown> = {};
+    const allKeys = new Set([
+      ...Object.keys(base),
+      ...Object.keys(ours),
+      ...Object.keys(theirs),
+    ]);
+
+    for (const key of allKeys) {
+      const inBase = Object.hasOwn(base, key);
+      const inOurs = Object.hasOwn(ours, key);
+      const inTheirs = Object.hasOwn(theirs, key);
+
+      if (inBase) {
+        if (inOurs && inTheirs) {
+          // 两边都有：可能都修改了，递归合并
+          const oursChanged = !deepEqual(ours[key], base[key]);
+          const theirsChanged = !deepEqual(theirs[key], base[key]);
+
+          if (oursChanged && theirsChanged) {
+            // 两边都修改了
+            if (isPlainObject(ours[key]) && isPlainObject(theirs[key]) && isPlainObject(base[key])) {
+              // 都是对象，递归 3-way merge
+              result[key] = this.threeWayMerge(
+                base[key] as Record<string, unknown>,
+                ours[key] as Record<string, unknown>,
+                theirs[key] as Record<string, unknown>,
+                oursTimestamp,
+                theirsTimestamp,
+              );
+            } else {
+              // 非对象冲突，LWW
+              result[key] = preferTheirs ? theirs[key] : ours[key];
+            }
+          } else if (oursChanged) {
+            result[key] = ours[key];
+          } else if (theirsChanged) {
+            result[key] = theirs[key];
+          } else {
+            // 都没改
+            result[key] = ours[key];
+          }
+        } else if (inOurs) {
+          // theirs 删除了
+          if (deepEqual(ours[key], base[key])) {
+            // ours 没改，theirs 删了 → 删除生效
+            continue;
+          }
+          // ours 改了，theirs 删了 → 冲突，修改方赢（保留 ours）
           result[key] = ours[key];
-        } else {
-          // 只在 theirs 中
+        } else if (inTheirs) {
+          // ours 删除了
+          if (deepEqual(theirs[key], base[key])) {
+            // theirs 没改，ours 删了 → 删除生效
+            continue;
+          }
+          // theirs 改了，ours 删了 → 冲突，保留 theirs
+          result[key] = theirs[key];
+        }
+        // else: 两边都删了 → 不加入 result
+      } else {
+        // base 中没有
+        if (inOurs && inTheirs) {
+          // 两边都添加了
+          if (isPlainObject(ours[key]) && isPlainObject(theirs[key])) {
+            result[key] = this.threeWayMerge(
+              {},
+              ours[key] as Record<string, unknown>,
+              theirs[key] as Record<string, unknown>,
+              oursTimestamp,
+              theirsTimestamp,
+            );
+          } else {
+            // 冲突，LWW
+            result[key] = preferTheirs ? theirs[key] : ours[key];
+          }
+        } else if (inOurs) {
+          result[key] = ours[key];
+        } else if (inTheirs) {
           result[key] = theirs[key];
         }
       }
-
-      return result;
     }
 
-    // 如果类型不同或不是对象，根据策略选择
-    return preferTheirs ? theirs : ours;
-  }
-
-  // 检查是否是普通对象
-  private isPlainObject(value: any): boolean {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
+    return result;
   }
 
   // 获取 commit 的 timestamp（Unix 秒）
   private async getCommitTimestamp(ref: string): Promise<number> {
-    const timestamp = await this.git.raw(['log', '-1', '--format=%ct', ref]);
-    return parseInt(timestamp.trim(), 10);
+    try {
+      const timestamp = await this.git.raw(['log', '-1', '--format=%ct', ref]);
+      const parsed = parseInt(timestamp.trim(), 10);
+      if (isNaN(parsed)) {
+        throw new Error(`Invalid timestamp for ref ${ref}: "${timestamp}"`);
+      }
+      return parsed;
+    } catch (error: any) {
+      throw new Error(`Failed to get timestamp for ref ${ref}: ${error.message}`);
+    }
   }
 
   // 获取提交历史
@@ -278,5 +505,10 @@ export class Git {
   // 获取工作目录
   getCwd(): string {
     return this.cwd;
+  }
+
+  // 获取当前分支
+  getBranch(): string {
+    return this.branch;
   }
 }
